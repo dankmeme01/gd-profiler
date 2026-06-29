@@ -1,4 +1,2 @@
-multi-demangle>=1.0.4
 pydantic>=2.13.4
 pefile>=2024.8.26
-requests>=2.34.2

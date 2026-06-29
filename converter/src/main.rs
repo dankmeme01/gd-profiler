@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 use fxprof_processed_profile::{
     Category, CategoryColor, CategoryHandle, CpuDelta, FrameAddress, FrameFlags, LibraryHandle,
@@ -8,13 +11,11 @@ use fxprof_processed_profile::{
     symbol_info::{AddressFrame, AddressInfo, LibSymbolInfo, ProfileSymbolInfo, SymbolStringTable},
 };
 use regex::Regex;
-use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
+use wholesym::{FrameDebugInfo, LookupAddress, SymbolManager, SymbolManagerConfig, SymbolMap};
 
 #[derive(Default)]
 struct StackFrame<'a> {
     address: u64,
-    symbol: Option<&'a str>,
-    symbol_offset: Option<u64>,
     source: &'a str,
 }
 
@@ -35,32 +36,8 @@ impl StackFrame<'_> {
         let remaining = line[..open_paren].trim_end();
         let first_space = remaining.find(' ')?;
         let address = u64::from_str_radix(&remaining[..first_space], 16).ok()?;
-        let middle = remaining[first_space + 1..].trim();
 
-        let mut symbol = Some(middle);
-        let mut offset = None;
-
-        if middle == "[unknown]" {
-            symbol = None;
-        } else {
-            let re_offset = Regex::new(r"\+0x([A-Fa-f0-9]+)$").unwrap();
-            if let Some(caps) = re_offset.captures(middle) {
-                let cap_match = caps.get(0).unwrap();
-                let offset_str = caps.get(1).unwrap().as_str();
-
-                offset = u64::from_str_radix(offset_str, 16).ok();
-
-                let sym_end = middle.len() - cap_match.as_str().len();
-                symbol = Some(middle[..sym_end].trim_end());
-            }
-        }
-
-        Some(StackFrame {
-            address,
-            symbol,
-            symbol_offset: offset,
-            source,
-        })
+        Some(StackFrame { address, source })
     }
 
     pub fn choose_category(&self, rdata: &RuntimeData) -> CategoryHandle {
@@ -68,21 +45,54 @@ impl StackFrame<'_> {
             return rdata.kernel_category;
         }
 
-        eprintln!("gd_dir: {}, source: {}", rdata.gd_dir, self.source);
-        if !self.source.starts_with(&rdata.gd_dir) {
-            return rdata.system_category;
+        let Some(library) = rdata.lookup_address(self.address) else {
+            eprintln!("lookup failed for {:x}", self.address);
+            return rdata.other_category;
+        };
+
+        let info = rdata.profile.get_library_info(library);
+        let library_path = PathBuf::from(&info.path);
+        let library_name = library_path.file_name().unwrap().to_string_lossy();
+        let (base_name, _) = library_name.rsplit_once('.').unwrap();
+
+        if library_name.ends_with(".exe") {
+            return rdata.gd_category;
         }
 
-        // TODO: somehow get tuliphook jit?
+        if library_name == "libcocos2d.dll" || library_name == "libExtensions.dll" {
+            return rdata.cocos_category;
+        }
 
-        rdata.user_category
+        if library_name == "Geode.dll" {
+            return rdata.mods_category;
+        }
+
+        if info.path.contains("geode/unzipped")
+            && library_path
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                == base_name
+        {
+            // this is a mod dll
+            return rdata.mods_category;
+        }
+
+        if self.source.ends_with(".map") {
+            // user library
+            rdata.user_category
+        } else {
+            // system wine dll
+            rdata.system_category
+        }
     }
 }
 
 struct Sample<'a> {
     thread: ThreadHandle,
     timestamp: Timestamp,
-    raw_timestamp: f64,
     sample_num: u64,
     frames: Vec<StackFrame<'a>>,
 }
@@ -114,6 +124,13 @@ impl PerfHeader<'_> {
     }
 }
 
+#[derive(Clone)]
+struct StoredLibrary {
+    handle: LibraryHandle,
+    base_address: u64,
+    size: u64,
+}
+
 struct RuntimeData {
     profile: Profile,
     process: ProcessHandle,
@@ -122,15 +139,60 @@ struct RuntimeData {
     user_category: CategoryHandle,
     system_category: CategoryHandle,
     kernel_category: CategoryHandle,
+    gd_category: CategoryHandle,
+    cocos_category: CategoryHandle,
+    mods_category: CategoryHandle,
+    other_category: CategoryHandle,
+
+    libs: HashMap<String, StoredLibrary>,
+    libs_sorted: BTreeMap<u64, StoredLibrary>,
+    symbol_manager: SymbolManager,
     gd_dir: String,
 }
 
 impl RuntimeData {
+    pub fn new(
+        mut profile: Profile,
+        process: ProcessHandle,
+        pid: u32,
+        ms_per_sample: f64,
+        gd_dir: String,
+    ) -> Self {
+        let user_category = profile.handle_for_category(Category("User", CategoryColor::Yellow));
+        let system_category =
+            profile.handle_for_category(Category("System", CategoryColor::Orange));
+        let kernel_category = profile.handle_for_category(Category("Kernel", CategoryColor::Red));
+        let gd_category =
+            profile.handle_for_category(Category("Geometry Dash", CategoryColor::LightBlue));
+        let cocos_category =
+            profile.handle_for_category(Category("cocos2d-x", CategoryColor::Blue));
+        let mods_category =
+            profile.handle_for_category(Category("Geode Mods", CategoryColor::Purple));
+        let other_category = profile.handle_for_category(Category::OTHER);
+
+        Self {
+            profile,
+            process,
+            pid,
+            ms_per_sample,
+            user_category,
+            system_category,
+            kernel_category,
+            gd_category,
+            cocos_category,
+            mods_category,
+            other_category,
+
+            libs: HashMap::new(),
+            libs_sorted: BTreeMap::new(),
+            symbol_manager: SymbolManager::with_config(SymbolManagerConfig::default()),
+            gd_dir,
+        }
+    }
+
     pub fn populate_libraries(&mut self) {
         let meta_data = std::fs::read_to_string(format!("/tmp/perf-{}.meta.txt", self.pid))
             .expect("failed to read meta.txt");
-
-        let mut libs = HashMap::new();
 
         let mut at_maps = false;
         for line in meta_data.lines() {
@@ -144,13 +206,14 @@ impl RuntimeData {
             }
 
             if !at_maps {
-                let (_, path) = line.split_once(' ').unwrap();
+                let (address, path) = line.split_once(' ').unwrap();
                 let name = PathBuf::from(path)
                     .file_name()
                     .unwrap()
                     .to_string_lossy()
                     .into_owned();
 
+                let address = u64::from_str_radix(address, 16).unwrap();
                 let lib = self.profile.add_lib(LibraryInfo {
                     name: name.clone(),
                     debug_name: name.clone(),
@@ -160,26 +223,52 @@ impl RuntimeData {
                     code_id: None,
                     arch: Some("x86_64".to_string()),
                 });
-                libs.insert(path.to_string(), lib);
+
+                let library = StoredLibrary {
+                    handle: lib,
+                    base_address: address,
+                    size: 0,
+                };
+                self.libs.insert(path.to_string(), library.clone());
+                self.libs_sorted.insert(address, library);
             } else {
                 let (start_end, path) = line.rsplit_once(' ').unwrap();
                 let (start, end) = start_end.split_once(' ').unwrap();
 
                 let start = u64::from_str_radix(start, 16).unwrap();
                 let end = u64::from_str_radix(end, 16).unwrap();
-                let Some(lib) = libs.get(path) else {
+                let Some(lib) = self.libs.get_mut(path) else {
+                    continue;
+                };
+                let Some(sorted_lib) = self.libs_sorted.get_mut(&lib.base_address) else {
                     continue;
                 };
 
-                self.profile
-                    .add_lib_mapping(self.process, *lib, start, end, 0);
+                self.profile.add_lib_mapping(
+                    self.process,
+                    lib.handle,
+                    start,
+                    end,
+                    (start - lib.base_address) as u32,
+                );
+                lib.size = lib.size.max(end - lib.base_address);
+                sorted_lib.size = lib.size;
             }
         }
     }
 
+    pub fn lookup_address(&self, address: u64) -> Option<LibraryHandle> {
+        let (_, lib) = self.libs_sorted.range(..=address).next_back()?;
+
+        if address >= lib.base_address + lib.size {
+            return None;
+        }
+
+        Some(lib.handle)
+    }
+
     pub async fn symbolicate(mut self) -> anyhow::Result<Self> {
-        let modules: Vec<(LibraryHandle, std::collections::BTreeSet<u32>)> =
-            self.profile.native_frame_addresses_per_library();
+        let modules = self.profile.native_frame_addresses_per_library();
 
         let mut profile_symbols = ProfileSymbolInfo {
             string_table: SymbolStringTable::new(),
@@ -187,10 +276,10 @@ impl RuntimeData {
         };
 
         for (lib, addrs) in modules {
-            let manager = SymbolManager::with_config(SymbolManagerConfig::default());
             let info = self.profile.get_library_info(lib);
 
-            let symbol_map = match manager
+            let symbol_map = match self
+                .symbol_manager
                 .load_symbol_map_for_binary_at_path(&PathBuf::from(&info.path), None)
                 .await
             {
@@ -210,32 +299,37 @@ impl RuntimeData {
                 if let Some(si) = symbol_map.lookup(LookupAddress::Relative(addr)).await {
                     lib_symbol_info.sorted_addresses.push(addr);
 
-                    let mut frames = Vec::new();
-                    if let Some(dbf) = si.frames {
-                        for fdi in dbf {
-                            frames.push(AddressFrame {
-                                function_name: profile_symbols
-                                    .string_table
-                                    .index_for_string(&fdi.function.unwrap_or_default()),
-                                file: fdi.file_path.map(|p| {
-                                    profile_symbols.string_table.index_for_string(p.raw_path())
-                                }),
-                                col: None,
-                                line: fdi.line_number,
-                                function_start_col: None,
-                                function_start_line: None,
-                            });
-                        }
-                    }
+                    // TODO this is a bit buggy, im not sure how to use it correctly
+                    // might be due to lbr messing things up
+
+                    // let frames = si
+                    //     .frames
+                    //     .as_ref()
+                    //     .map(|frames| {
+                    //         frames
+                    //             .iter()
+                    //             .flat_map(|fdi| {
+                    //                 convert_address_frame(
+                    //                     fdi,
+                    //                     &mut profile_symbols.string_table,
+                    //                     &symbol_map,
+                    //                 )
+                    //             })
+                    //             .collect()
+                    //     })
+                    //     .unwrap_or_default();
+                    let frames = Vec::new();
 
                     lib_symbol_info.address_infos.push(AddressInfo {
                         symbol_name: profile_symbols
                             .string_table
-                            .index_for_string(&si.symbol.name),
+                            .index_for_string(&symbol_map.resolve_symbol_name(si.symbol.name)),
                         symbol_start_address: si.symbol.address,
                         symbol_size: si.symbol.size,
                         frames,
                     });
+                } else {
+                    // eprintln!("{} + {:x} -> ??", info.name, addr);
                 }
             }
 
@@ -247,6 +341,27 @@ impl RuntimeData {
 
         Ok(self)
     }
+}
+
+fn convert_address_frame(
+    frame: &FrameDebugInfo,
+    strtab: &mut SymbolStringTable,
+    symbol_map: &SymbolMap,
+) -> Option<AddressFrame> {
+    let function_handle = symbol_map.resolve_function_name(frame.function?);
+    let function_name = strtab.index_for_string(&function_handle);
+    let file = frame.file_path.map(|handle| {
+        strtab.index_for_string(symbol_map.resolve_source_file_path(handle).raw_path())
+    });
+
+    Some(AddressFrame {
+        function_name,
+        file,
+        line: frame.line_number,
+        col: frame.column_number,
+        function_start_line: frame.function_start_line,
+        function_start_col: frame.function_start_column,
+    })
 }
 
 #[tokio::main]
@@ -291,25 +406,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Timestamp::from_millis_since_reference(0.0),
     );
 
-    let user_category = profile.handle_for_category(Category("User", CategoryColor::Yellow));
-    let system_category = profile.handle_for_category(Category("System", CategoryColor::Orange));
-    let kernel_category = profile.handle_for_category(Category("Kernel", CategoryColor::LightRed));
-    let mut rtdata = RuntimeData {
+    let mut rtdata = RuntimeData::new(
         profile,
         process,
         pid,
-        ms_per_sample: 1000.0 / frequency as f64,
-        user_category,
-        system_category,
-        kernel_category,
-        gd_dir: PathBuf::from(gd_exe)
+        1000.0 / frequency as f64,
+        PathBuf::from(gd_exe)
             .canonicalize()
             .unwrap()
             .parent()
             .unwrap()
             .to_string_lossy()
             .into_owned(),
-    };
+    );
+
     rtdata.populate_libraries();
 
     let mut threads = HashMap::new();
@@ -343,7 +453,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample = Some(Sample {
                 thread,
                 timestamp: cvt_time(header.timestamp),
-                raw_timestamp: header.timestamp,
                 sample_num: header.sample_number,
                 frames: Vec::new(),
             });
@@ -385,11 +494,20 @@ fn commit_sample(rdata: &mut RuntimeData, s: Option<Sample<'_>>) {
             if category == rdata.kernel_category {
                 FrameAddress::KernelInstructionPointer(frame.address)
             } else {
-                FrameAddress::InstructionPointer(rdata.process, frame.address)
+                FrameAddress::ReturnAddress(rdata.process, frame.address)
             },
             category,
             FrameFlags::empty(),
         );
+
+        // For debugging, raw addresses
+        // let strh = rdata
+        //     .profile
+        //     .handle_for_string(&format!("0x{:x} ({})", frame.address, frame.source));
+        // let frame_handle =
+        //     rdata
+        //         .profile
+        //         .handle_for_frame_with_label(strh, category, FrameFlags::empty());
 
         cur_node = Some(rdata.profile.handle_for_stack(frame_handle, cur_node));
     }
