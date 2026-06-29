@@ -323,8 +323,6 @@ impl RuntimeData {
             sorted_lib.size = lib.size;
         }
 
-        let mut last_heap = 0.0;
-        let mut last_total = 0.0;
         for &(rel_timestamp, heap_bytes, total_bytes) in &self.meta.memory {
             let time = Timestamp::from_millis_since_reference(
                 Duration::from_secs_f64(rel_timestamp).as_millis_f64(),
@@ -332,18 +330,11 @@ impl RuntimeData {
             let total_bytes = total_bytes as f64;
             let heap_bytes = heap_bytes as f64;
 
-            eprintln!(
-                "delta: {} {}",
-                total_bytes - last_total,
-                heap_bytes - last_heap
-            );
+            // note: despite the arg saying value_delta, it actually expects an absolute value
             self.profile
                 .add_counter_sample(self.memory_counter, time, total_bytes, 1);
             self.profile
                 .add_counter_sample(self.heap_counter, time, heap_bytes, 1);
-
-            last_heap = heap_bytes;
-            last_total = total_bytes;
         }
     }
 
