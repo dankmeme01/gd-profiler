@@ -51,7 +51,6 @@ If everything goes well, you'll see the following logs:
 ...
 [profiler] nothing has been loaded in the last 3 seconds, assuming the game finished launching
 [profiler] total modules loaded: 247
-[profiler] writing metadata to /tmp/perf-<pid>.meta.txt
 [profiler] nothing else to do, waiting for the game to exit...
 ```
 
