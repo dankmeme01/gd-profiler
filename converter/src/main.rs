@@ -1,12 +1,15 @@
+#![feature(duration_millis_float)]
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
+    time::Duration,
 };
 
 use fxprof_processed_profile::{
-    Category, CategoryColor, CategoryHandle, CpuDelta, FrameAddress, FrameFlags, LibraryHandle,
-    LibraryInfo, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, ThreadHandle,
-    Timestamp,
+    Category, CategoryColor, CategoryHandle, CounterHandle, CpuDelta, FrameAddress, FrameFlags,
+    GraphColor, LibraryHandle, LibraryInfo, ProcessHandle, Profile, ReferenceTimestamp,
+    SamplingInterval, ThreadHandle, Timestamp,
     debugid::DebugId,
     symbol_info::{AddressFrame, AddressInfo, LibSymbolInfo, ProfileSymbolInfo, SymbolStringTable},
 };
@@ -131,6 +134,76 @@ struct StoredLibrary {
     size: u64,
 }
 
+#[derive(Clone, Default)]
+struct PerfMeta {
+    modules: Vec<(u64, String)>,
+    maps: Vec<(u64, u64, String)>,
+    memory: Vec<(f64, u64, u64)>,
+}
+
+impl PerfMeta {
+    pub fn parse(data: &str) -> anyhow::Result<PerfMeta> {
+        let mut meta = PerfMeta::default();
+        let mut lines = data.lines();
+
+        // modules
+        for line in lines.by_ref() {
+            if line == "Maps:" {
+                break;
+            } else if line == "Modules:" || line.is_empty() {
+                continue;
+            }
+
+            let (address, filepath) = line
+                .split_once(' ')
+                .ok_or_else(|| anyhow::anyhow!("failed to parse module line: {}", line))?;
+
+            let address = u64::from_str_radix(address, 16)?;
+            meta.modules.push((address, filepath.to_string()));
+        }
+
+        // maps
+        for line in lines.by_ref() {
+            if line == "Memory:" {
+                break;
+            } else if line.is_empty() {
+                continue;
+            }
+
+            let (start_end, filepath) = line
+                .rsplit_once(' ')
+                .ok_or_else(|| anyhow::anyhow!("failed to parse map line: {}", line))?;
+
+            let (start, end) = start_end
+                .split_once(' ')
+                .ok_or_else(|| anyhow::anyhow!("failed to parse map line: {}", line))?;
+
+            let start = u64::from_str_radix(start, 16)?;
+            let end = u64::from_str_radix(end, 16)?;
+            meta.maps.push((start, end, filepath.to_string()));
+        }
+
+        // memory
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let parts = line.split(' ').collect::<Vec<_>>();
+            if parts.len() != 3 {
+                return Err(anyhow::anyhow!("failed to parse memory line: {}", line));
+            }
+
+            let timestamp = parts[0].parse::<f64>()?;
+            let heap_total = parts[1].parse::<u64>()?;
+            let total = parts[2].parse::<u64>()?;
+
+            meta.memory.push((timestamp, heap_total, total));
+        }
+
+        Ok(meta)
+    }
+}
+
 struct RuntimeData {
     profile: Profile,
     process: ProcessHandle,
@@ -143,6 +216,9 @@ struct RuntimeData {
     cocos_category: CategoryHandle,
     mods_category: CategoryHandle,
     other_category: CategoryHandle,
+    meta: PerfMeta,
+    memory_counter: CounterHandle,
+    heap_counter: CounterHandle,
 
     libs: HashMap<String, StoredLibrary>,
     libs_sorted: BTreeMap<u64, StoredLibrary>,
@@ -170,6 +246,15 @@ impl RuntimeData {
             profile.handle_for_category(Category("Geode Mods", CategoryColor::Purple));
         let other_category = profile.handle_for_category(Category::OTHER);
 
+        let memory_counter = profile.add_counter(process, "Total memory", "memory", "Total memory");
+        profile.set_counter_color(memory_counter, GraphColor::Orange);
+        let heap_counter = profile.add_counter(process, "Heap memory", "memory", "Heap memory");
+        profile.set_counter_color(heap_counter, GraphColor::Yellow);
+
+        let meta_data = std::fs::read_to_string(format!("/tmp/perf-{}.meta.txt", pid))
+            .expect("failed to read meta.txt");
+        let meta = PerfMeta::parse(&meta_data).expect("failed to parse meta.txt");
+
         Self {
             profile,
             process,
@@ -182,7 +267,9 @@ impl RuntimeData {
             cocos_category,
             mods_category,
             other_category,
-
+            meta,
+            memory_counter,
+            heap_counter,
             libs: HashMap::new(),
             libs_sorted: BTreeMap::new(),
             symbol_manager: SymbolManager::with_config(SymbolManagerConfig::default()),
@@ -190,70 +277,73 @@ impl RuntimeData {
         }
     }
 
-    pub fn populate_libraries(&mut self) {
-        let meta_data = std::fs::read_to_string(format!("/tmp/perf-{}.meta.txt", self.pid))
-            .expect("failed to read meta.txt");
+    pub fn initialize(&mut self) {
+        for (address, path) in &self.meta.modules {
+            let name = PathBuf::from(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
 
-        let mut at_maps = false;
-        for line in meta_data.lines() {
-            if line.starts_with("Modules") || line.is_empty() {
+            let lib = self.profile.add_lib(LibraryInfo {
+                name: name.clone(),
+                debug_name: name.clone(),
+                path: path.to_string(),
+                debug_path: String::new(),
+                debug_id: DebugId::nil(),
+                code_id: None,
+                arch: Some("x86_64".to_string()),
+            });
+
+            let library = StoredLibrary {
+                handle: lib,
+                base_address: *address,
+                size: 0,
+            };
+            self.libs.insert(path.to_string(), library.clone());
+            self.libs_sorted.insert(*address, library);
+        }
+
+        for (start, end, path) in &self.meta.maps {
+            let Some(lib) = self.libs.get_mut(path) else {
                 continue;
-            }
-
-            if line.starts_with("Maps") {
-                at_maps = true;
+            };
+            let Some(sorted_lib) = self.libs_sorted.get_mut(&lib.base_address) else {
                 continue;
-            }
+            };
 
-            if !at_maps {
-                let (address, path) = line.split_once(' ').unwrap();
-                let name = PathBuf::from(path)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
+            self.profile.add_lib_mapping(
+                self.process,
+                lib.handle,
+                *start,
+                *end,
+                (start - lib.base_address) as u32,
+            );
+            lib.size = lib.size.max(end - lib.base_address);
+            sorted_lib.size = lib.size;
+        }
 
-                let address = u64::from_str_radix(address, 16).unwrap();
-                let lib = self.profile.add_lib(LibraryInfo {
-                    name: name.clone(),
-                    debug_name: name.clone(),
-                    path: path.to_string(),
-                    debug_path: String::new(),
-                    debug_id: DebugId::nil(),
-                    code_id: None,
-                    arch: Some("x86_64".to_string()),
-                });
+        let mut last_heap = 0.0;
+        let mut last_total = 0.0;
+        for &(rel_timestamp, heap_bytes, total_bytes) in &self.meta.memory {
+            let time = Timestamp::from_millis_since_reference(
+                Duration::from_secs_f64(rel_timestamp).as_millis_f64(),
+            );
+            let total_bytes = total_bytes as f64;
+            let heap_bytes = heap_bytes as f64;
 
-                let library = StoredLibrary {
-                    handle: lib,
-                    base_address: address,
-                    size: 0,
-                };
-                self.libs.insert(path.to_string(), library.clone());
-                self.libs_sorted.insert(address, library);
-            } else {
-                let (start_end, path) = line.rsplit_once(' ').unwrap();
-                let (start, end) = start_end.split_once(' ').unwrap();
+            eprintln!(
+                "delta: {} {}",
+                total_bytes - last_total,
+                heap_bytes - last_heap
+            );
+            self.profile
+                .add_counter_sample(self.memory_counter, time, total_bytes, 1);
+            self.profile
+                .add_counter_sample(self.heap_counter, time, heap_bytes, 1);
 
-                let start = u64::from_str_radix(start, 16).unwrap();
-                let end = u64::from_str_radix(end, 16).unwrap();
-                let Some(lib) = self.libs.get_mut(path) else {
-                    continue;
-                };
-                let Some(sorted_lib) = self.libs_sorted.get_mut(&lib.base_address) else {
-                    continue;
-                };
-
-                self.profile.add_lib_mapping(
-                    self.process,
-                    lib.handle,
-                    start,
-                    end,
-                    (start - lib.base_address) as u32,
-                );
-                lib.size = lib.size.max(end - lib.base_address);
-                sorted_lib.size = lib.size;
-            }
+            last_heap = heap_bytes;
+            last_total = total_bytes;
         }
     }
 
@@ -420,7 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_owned(),
     );
 
-    rtdata.populate_libraries();
+    rtdata.initialize();
 
     let mut threads = HashMap::new();
 

@@ -7,6 +7,7 @@ import argparse
 import time
 import pefile
 import shutil
+from threading import Thread
 from pydantic import BaseModel
 from pathlib import Path
 
@@ -23,7 +24,14 @@ class LoadedModule(BaseModel):
     full_path: Path
     base: int
 
+class MemoryMeasurement(BaseModel):
+    timestamp: float # seconds since start
+    heap_bytes: int
+    total_bytes: int
+
 work_dir: Path = Path.cwd()
+memory_measurements: list[MemoryMeasurement] = []
+stopping: bool = False
 
 def parse_maps(pid: int) -> list[MemoryMapping]:
     mappings: list[MemoryMapping] = []
@@ -70,6 +78,22 @@ def parse_maps(pid: int) -> list[MemoryMapping]:
 
     return out_mappings
 
+def parse_used_memory(pid: int) -> MemoryMeasurement:
+    data = {}
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if ':' not in line: continue
+        name, _, value = line.partition(':')
+        data[name] = value.strip()
+
+    vm_rss = int(data.get("VmRSS", "0 kB").partition(' ')[0]) * 1024
+    rss_anon = int(data.get("RssAnon", "0 kB").partition(' ')[0]) * 1024
+
+    return MemoryMeasurement(
+        timestamp=0.0,
+        heap_bytes=rss_anon,
+        total_bytes=vm_rss
+    )
+
 def get_loaded_modules(maps: list[MemoryMapping]) -> dict[str, LoadedModule]:
     modules = {}
 
@@ -94,6 +118,20 @@ def get_loaded_modules(maps: list[MemoryMapping]) -> dict[str, LoadedModule]:
 def get_wine_version(wine_path: Path) -> str:
     result = subprocess.run([str(wine_path), "--version"], capture_output=True, text=True, check=True)
     return result.stdout.strip()
+
+def memory_measure_worker(pid: int, epoch: float):
+    # wait a bit for it to launch
+    time.sleep(0.1)
+
+    while not stopping:
+        try:
+            m = parse_used_memory(pid)
+            m.timestamp = time.time() - epoch
+            memory_measurements.append(m)
+        except Exception as e:
+            print(f"error getting used memory: {e}")
+
+        time.sleep(0.02)
 
 # Run GD in Wine and return the PID
 def run_gd(wine_path: Path, gd_path: Path, gd_args: list[str]) -> subprocess.Popen:
@@ -173,10 +211,16 @@ if __name__ == "__main__":
     )
     pid = gd.pid
     print(f"[profiler] GD is running, pid: {pid}")
+    aux_workers = []
 
-    start_time = int(time.time() * 1000)
+    start_time = time.time()
     perf = run_perf(pid=pid, freq=args.frequency, use_lbr=not args.no_lbr)
     print(f"[profiler] perf is now capturing samples")
+
+    # spawn memory worker
+    mem_worker = Thread(target=memory_measure_worker, args=(pid, start_time), daemon=True)
+    aux_workers.append(mem_worker)
+    mem_worker.start()
 
     print(f"[profiler] waiting for the game to finish launching..")
     last_modules_added = time.time()
@@ -196,7 +240,17 @@ if __name__ == "__main__":
         time.sleep(0.25)
 
     print(f"[profiler] total modules loaded: {len(modules)}")
+    print(f"[profiler] nothing else to do, waiting for the game to exit...")
+    gd.wait()
+    print(f"[profiler] game exit detected, stopping perf")
+    stopping = True
+    perf.terminate()
+    perf.wait()
 
+    # join all workers
+    [worker.join() for worker in aux_workers]
+
+    print(f"[profiler] writing metadata to /tmp/perf-{gd.pid}.meta.txt")
     with open(f"/tmp/perf-{gd.pid}.meta.txt", 'w') as f:
         f.write(f"Modules:\n")
         for module in modules.values():
@@ -206,17 +260,14 @@ if __name__ == "__main__":
         for map in maps:
             f.write(f"{map.start:x} {map.end:x} {map.pathname}\n")
 
-    print(f"[profiler] writing metadata to /tmp/perf-{gd.pid}.meta.txt")
-    print(f"[profiler] nothing else to do, waiting for the game to exit...")
-    gd.wait()
-    print(f"[profiler] game exit detected, stopping perf")
-    perf.terminate()
-    perf.wait()
+        f.write(f"\nMemory:\n")
+        for m in memory_measurements:
+            f.write(f"{m.timestamp:.6f} {m.heap_bytes} {m.total_bytes}\n")
 
     print(f"[profiler] running perf script to convert the profile into text...")
     p = run_perf_conversion(pid)
     print(f"[profiler] raw profile now available at {p}, let's see if we can convert to fxprof...")
-    fxp = run_fxprof_conversion(gd.pid, p, args.frequency, args.gd_exe, start_time)
+    fxp = run_fxprof_conversion(gd.pid, p, args.frequency, args.gd_exe, int(start_time * 1000.0))
     if fxp:
         print(f"[profiler] fxprof profile now available at {fxp} and can be loaded at https://profiler.firefox.com/")
     else:

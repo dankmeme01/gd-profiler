@@ -59,6 +59,9 @@ If everything goes well, you'll see the following logs:
 
 After you close the game, the script will start processing the perf data and convert it into a Firefox profiler format that you can view at https://profiler.firefox.com
 
+Note that the data is not perfect, many stacks may stop after 10-15 functions even if they should go deeper, unfortunately as of now I could not figure out a fix to this, but the profiler is more than usable despite that.
+
 # TODO
 
-* memory, thread events
+* thread events to display accurate thread ends?
+* figure out how to fix the stacks, `--stitch-lbr` or `--call-graph dwarf` do not work
