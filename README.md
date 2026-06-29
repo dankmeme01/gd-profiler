@@ -1,5 +1,9 @@
 # GD Linux profiler
 
+This repository contains helper scripts & programs to profile Geometry Dash running in Proton/Wine with Linux `perf`, producing Firefox fxprof profiler files that can be viewed in the Firefox profiler UI.
+
+![screenshot](./screenshot.png)
+
 > [!NOTE]
 > The profiler requires the LBR feature to be present in your CPU, available since Intel Haswell (4th gen or newer) or AMD Zen 4 (or newer) CPU with Linux 6.1+.
 
@@ -57,5 +61,4 @@ After you close the game, the script will start processing the perf data and con
 
 # TODO
 
-* more frame colors
 * memory, thread events
