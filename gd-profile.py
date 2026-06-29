@@ -127,11 +127,11 @@ def run_perf(pid: int, freq: int = 1000, use_lbr: bool = False, use_cpu_clock: b
         stdout=subprocess.DEVNULL,
     )
 
-def run_perf_conversion() -> Path:
+def run_perf_conversion(pid: int) -> Path:
     p = Path.cwd() / "profile.perf"
     f = open(p, "w")
     subprocess.run(
-        ["perf", "script", "-F", "+pid"],
+        ["perf", "script", "-F", "+pid", f"--pid={pid}", "--stitch-lbr"],
         stdout=f,
         check=True,
     )
@@ -214,7 +214,7 @@ if __name__ == "__main__":
     perf.wait()
 
     print(f"[profiler] running perf script to convert the profile into text...")
-    p = run_perf_conversion()
+    p = run_perf_conversion(pid)
     print(f"[profiler] raw profile now available at {p}, let's see if we can convert to fxprof...")
     fxp = run_fxprof_conversion(gd.pid, p, args.frequency, args.gd_exe, start_time)
     if fxp:
