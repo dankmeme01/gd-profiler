@@ -46,7 +46,7 @@ impl StackFrame<'_> {
         }
 
         let Some(library) = rdata.lookup_address(self.address) else {
-            eprintln!("lookup failed for {:x}", self.address);
+            // eprintln!("lookup failed for {:x}", self.address);
             return rdata.other_category;
         };
 
