@@ -60,6 +60,10 @@ After you close the game, the script will start processing the perf data and con
 
 Note that the data is not perfect, many stacks may stop after 10-15 functions even if they should go deeper, unfortunately as of now I could not figure out a fix to this, but the profiler is more than usable despite that.
 
+## Helper mod
+
+In the [`profiler-mod`](./profiler-mod/) subfolder, you will find the helper profiler mod. This mod hooks some parts of the game and provides various data for additional graphs. When not actively profiling, the mod is deactivated and does not do anything.
+
 # TODO
 
 * thread events to display accurate thread ends?

@@ -32,6 +32,8 @@ class MemoryMeasurement(BaseModel):
 work_dir: Path = Path.cwd()
 memory_measurements: list[MemoryMeasurement] = []
 stopping: bool = False
+maps: list[MemoryMapping] = []
+modules: dict[str, LoadedModule] = {}
 
 def parse_maps(pid: int) -> list[MemoryMapping]:
     mappings: list[MemoryMapping] = []
@@ -133,6 +135,19 @@ def memory_measure_worker(pid: int, epoch: float):
 
         time.sleep(0.02)
 
+def maps_measure_worker(proc: subprocess.Popen, epoch: float):
+    global maps, modules
+
+    while not stopping:
+        cur_maps = parse_maps(proc.pid)
+        cur_modules = get_loaded_modules(cur_maps)
+
+        if len(cur_modules) > 0:
+            maps = cur_maps
+            modules = cur_modules
+
+        time.sleep(0.25)
+
 # Run GD in Wine and return the PID
 def run_gd(wine_path: Path, gd_path: Path, gd_args: list[str]) -> subprocess.Popen:
     global work_dir
@@ -146,15 +161,15 @@ def run_gd(wine_path: Path, gd_path: Path, gd_args: list[str]) -> subprocess.Pop
     print(f"[profiler] Running {gd_path} with Wine {wine_path} (version {get_wine_version(wine_path)}), extra args: {gd_args}")
 
     return subprocess.Popen(
-        [str(wine_path), str(gd_path), *gd_args],
+        [str(wine_path), str(gd_path.absolute()), *gd_args],
         cwd=work_dir,
     )
 
-def run_perf(pid: int, freq: int = 1000, use_lbr: bool = False, use_cpu_clock: bool = False) -> subprocess.Popen:
+def run_perf(pid: int, freq: int = 1000, call_graph: str = "lbr", use_cpu_clock: bool = False) -> subprocess.Popen:
     cmdline = ["perf", "record", "-g", "-F", str(freq), "-p", str(pid)]
 
-    if use_lbr:
-        cmdline.extend(["--call-graph", "lbr"])
+    if call_graph:
+        cmdline.extend(["--call-graph", call_graph])
     if use_cpu_clock:
         cmdline.extend(["-e", "cpu-clock"])
 
@@ -198,7 +213,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--wine-path", type=Path, required=False, help="Path to the Wine executable")
     parser.add_argument("--frequency", "-F", type=int, required=False, default=1000, help="Sampling frequency for perf")
-    parser.add_argument("--no-lbr", action="store_true", help="Do not use LBR for perf")
+    parser.add_argument("--call-graph", "-g", default="lbr", help="Call graph method for perf (lbr, fp, dwarf)")
     parser.add_argument("gd_exe", type=Path, nargs="?", default=Path("GeometryDash.exe"), help="Path to the GD executable")
     parser.add_argument("gd_args", nargs=argparse.REMAINDER, help="Additional arguments to pass to GD")
 
@@ -214,7 +229,7 @@ if __name__ == "__main__":
     aux_workers = []
 
     start_time = time.time()
-    perf = run_perf(pid=pid, freq=args.frequency, use_lbr=not args.no_lbr)
+    perf = run_perf(pid=pid, freq=args.frequency, call_graph=args.call_graph)
     print(f"[profiler] perf is now capturing samples")
 
     # spawn memory worker
@@ -222,24 +237,11 @@ if __name__ == "__main__":
     aux_workers.append(mem_worker)
     mem_worker.start()
 
-    print(f"[profiler] waiting for the game to finish launching..")
-    last_modules_added = time.time()
-    last_modules = 0
+    # spawn maps and modules worker
+    maps_worker = Thread(target=maps_measure_worker, args=(gd, start_time), daemon=True)
+    aux_workers.append(maps_worker)
+    maps_worker.start()
 
-    while True:
-        maps = parse_maps(gd.pid)
-        modules = get_loaded_modules(maps)
-        if len(modules) != last_modules:
-            last_modules = len(modules)
-            last_modules_added = time.time()
-
-        if time.time() - last_modules_added > 3.0:
-            print(f"[profiler] nothing has been loaded in the last 3 seconds, assuming the game finished launching")
-            break
-
-        time.sleep(0.25)
-
-    print(f"[profiler] total modules loaded: {len(modules)}")
     print(f"[profiler] nothing else to do, waiting for the game to exit...")
     gd.wait()
     print(f"[profiler] game exit detected, stopping perf")

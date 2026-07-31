@@ -552,6 +552,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample.as_mut().unwrap().frames.push(frame);
     }
 
+    rtdata.profile.set_os_name(&get_os_name());
+
     commit_sample(&mut rtdata, sample.take());
 
     let rtdata = rtdata.symbolicate().await?;
@@ -598,4 +600,15 @@ fn commit_sample(rdata: &mut RuntimeData, s: Option<Sample<'_>>) {
     rdata
         .profile
         .add_sample(s.thread, s.timestamp, cur_node, cpu_delta, 1);
+}
+
+fn get_os_name() -> String {
+    let os_name = sysinfo::System::name().expect("failed to get os name");
+    let os_version = sysinfo::System::os_version().unwrap_or_default();
+
+    if os_version.is_empty() {
+        os_name
+    } else {
+        format!("{} {}", os_name, os_version)
+    }
 }
