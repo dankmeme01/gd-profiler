@@ -6,8 +6,8 @@
 using namespace geode::prelude;
 using namespace arc;
 
-static volatile uint64_t g_objectCreations = 0;
-static volatile uint64_t g_objectDeletions = 0;
+static volatile int64_t g_objectCreations = 0;
+static volatile int64_t g_objectDeletions = 0;
 
 struct WorkerData {
     std::unordered_map<std::string, int64_t> counters;
@@ -15,8 +15,8 @@ struct WorkerData {
 
 static WorkerData gatherData() {
     std::unordered_map<std::string, int64_t> counters;
-    uint64_t creations = InterlockedOr((volatile LONG*)&g_objectCreations, 0);
-    uint64_t deletions = InterlockedOr((volatile LONG*)&g_objectDeletions, 0);
+    int64_t creations = InterlockedOr64((volatile __int64*)&g_objectCreations, 0);
+    int64_t deletions = InterlockedOr64((volatile __int64*)&g_objectDeletions, 0);
     // log::debug("Creations: {}, Deletions: {}", creations, deletions);
 
     counters["Objects"] = creations - deletions;
