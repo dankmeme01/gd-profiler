@@ -29,7 +29,6 @@ void enableHooks();
 void disableHooks();
 
 Future<NetResult<>> socketWorker(uint16_t port) {
-    log::info("pre-connect");
     auto stream = ARC_CO_UNWRAP(co_await arc::TcpStream::connect(qsox::SocketAddress{qsox::Ipv4Address::LOCALHOST, port}));
     log::info("Connected to profiler parent on port {}", port);
 

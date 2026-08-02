@@ -34,7 +34,7 @@ Run in GD folder:
 gd-profile
 ```
 
-Customize frequency (default 1000) or wine path (default `$(which wine)`):
+Customize frequency (default 1000 Hz) or wine path (default `$(which wine)`):
 ```sh
 gd-profile -F 2000 --wine-path /usr/bin/wine
 ```
@@ -44,17 +44,21 @@ Customize executable & arguments:
 gd-profile MyGeometryGDPS.exe --geode:safe-mode
 ```
 
-If everything goes well, you'll see the following logs:
+If everything goes well, you'll see logs similar to this during profiling:
 ```
+[profiler] listening on port 57683 for incoming mod connections
+[profiler] Running GeometryDash.exe with Wine /usr/bin/wine (version wine-11.13), extra args: []
+[profiler] GD is running, pid: 73234
+[profiler] perf args: ['perf', 'record', '-g', '-F', '1000', '-p', '73234', '--call-graph', 'lbr']
 [profiler] perf is now capturing samples
-[profiler] waiting for the game to finish launching..
-...
-[profiler] nothing has been loaded in the last 3 seconds, assuming the game finished launching
-[profiler] total modules loaded: 247
 [profiler] nothing else to do, waiting for the game to exit...
+...
+[profiler] game exit detected, stopping perf
+...
+[profiler] fxprof profile now available at /home/dankpc/gd/instances/2.2081/profile.json and can be loaded at https://profiler.firefox.com/
 ```
 
-`perf` starts capturing right away as soon as the game is launched, but the script waits a few extra seconds to let all the mods and DLLs load fully and then dump all modules. If you close the game too quickly, results are undefined.
+As soon as the game is launched, multiple things are monitored: `perf` captures CPU samples, the helper mod (if installed) captures created `CCObject`s, and the script captures memory information as well as data about loaded binaries.
 
 After you close the game, the script will start processing the perf data and convert it into a Firefox profiler format that you can view at https://profiler.firefox.com
 
