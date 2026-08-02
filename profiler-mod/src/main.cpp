@@ -15,8 +15,9 @@ struct WorkerData {
 
 static WorkerData gatherData() {
     std::unordered_map<std::string, int64_t> counters;
-    int64_t creations = InterlockedOr64((volatile __int64*)&g_objectCreations, 0);
-    int64_t deletions = InterlockedOr64((volatile __int64*)&g_objectDeletions, 0);
+    int64_t creations = g_objectCreations;
+    int64_t deletions = g_objectDeletions;
+    _ReadWriteBarrier();
     // log::debug("Creations: {}, Deletions: {}", creations, deletions);
 
     counters["Objects"] = creations - deletions;
