@@ -1,19 +1,21 @@
 #![feature(duration_millis_float)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     time::Duration,
 };
 
 use fxprof_processed_profile::{
-    Category, CategoryColor, CategoryHandle, CounterHandle, CpuDelta, FrameAddress, FrameFlags,
-    GraphColor, LibraryHandle, LibraryInfo, ProcessHandle, Profile, ReferenceTimestamp,
-    SamplingInterval, ThreadHandle, Timestamp,
+    Category, CategoryColor, CategoryHandle, CpuDelta, FrameAddress, FrameFlags, GraphColor,
+    LibraryHandle, LibraryInfo, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval,
+    ThreadHandle, Timestamp,
     debugid::DebugId,
     symbol_info::{AddressFrame, AddressInfo, LibSymbolInfo, ProfileSymbolInfo, SymbolStringTable},
 };
 use regex::Regex;
+use serde::Deserialize;
 use wholesym::{FrameDebugInfo, LookupAddress, SymbolManager, SymbolManagerConfig, SymbolMap};
 
 #[derive(Default)]
@@ -96,18 +98,18 @@ impl StackFrame<'_> {
 struct Sample<'a> {
     thread: ThreadHandle,
     timestamp: Timestamp,
-    sample_num: u64,
+    // sample_num: u64,
     frames: Vec<StackFrame<'a>>,
 }
 
 #[derive(Debug)]
 struct PerfHeader<'a> {
     thread: &'a str,
-    pid: u32,
+    // pid: u32,
     tid: u32,
     timestamp: f64,
-    sample_number: u64,
-    event: &'a str,
+    // sample_number: u64,
+    // event: &'a str,
 }
 
 impl PerfHeader<'_> {
@@ -118,11 +120,11 @@ impl PerfHeader<'_> {
 
         Some(PerfHeader {
             thread: caps.get(1)?.as_str(),
-            pid: caps.get(2)?.as_str().parse().ok()?,
+            // pid: caps.get(2)?.as_str().parse().ok()?,
             tid: caps.get(3)?.as_str().parse().ok()?,
             timestamp: caps.get(4)?.as_str().parse().ok()?,
-            sample_number: caps.get(5)?.as_str().parse().ok()?,
-            event: caps.get(6)?.as_str(),
+            // sample_number: caps.get(5)?.as_str().parse().ok()?,
+            // event: caps.get(6)?.as_str(),
         })
     }
 }
@@ -134,80 +136,49 @@ struct StoredLibrary {
     size: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Deserialize)]
+struct PerfMetaModule {
+    #[allow(unused)]
+    name: String,
+    full_path: String,
+    base: u64,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct PerfMetaMap {
+    start: u64,
+    end: u64,
+    pathname: String,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct PerfMetaCounter {
+    timestamp: f64,
+    value: u64,
+}
+
+#[derive(Clone, Default, Deserialize)]
 struct PerfMeta {
-    modules: Vec<(u64, String)>,
-    maps: Vec<(u64, u64, String)>,
-    memory: Vec<(f64, u64, u64)>,
+    modules: Vec<PerfMetaModule>,
+    maps: Vec<PerfMetaMap>,
+    counters: HashMap<String, Vec<PerfMetaCounter>>,
+}
+
+struct CounterGraphProperties {
+    color: GraphColor,
+    category: String,
+    description: String,
 }
 
 impl PerfMeta {
     pub fn parse(data: &str) -> anyhow::Result<PerfMeta> {
-        let mut meta = PerfMeta::default();
-        let mut lines = data.lines();
-
-        // modules
-        for line in lines.by_ref() {
-            if line == "Maps:" {
-                break;
-            } else if line == "Modules:" || line.is_empty() {
-                continue;
-            }
-
-            let (address, filepath) = line
-                .split_once(' ')
-                .ok_or_else(|| anyhow::anyhow!("failed to parse module line: {}", line))?;
-
-            let address = u64::from_str_radix(address, 16)?;
-            meta.modules.push((address, filepath.to_string()));
-        }
-
-        // maps
-        for line in lines.by_ref() {
-            if line == "Memory:" {
-                break;
-            } else if line.is_empty() {
-                continue;
-            }
-
-            let (start_end, filepath) = line
-                .rsplit_once(' ')
-                .ok_or_else(|| anyhow::anyhow!("failed to parse map line: {}", line))?;
-
-            let (start, end) = start_end
-                .split_once(' ')
-                .ok_or_else(|| anyhow::anyhow!("failed to parse map line: {}", line))?;
-
-            let start = u64::from_str_radix(start, 16)?;
-            let end = u64::from_str_radix(end, 16)?;
-            meta.maps.push((start, end, filepath.to_string()));
-        }
-
-        // memory
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let parts = line.split(' ').collect::<Vec<_>>();
-            if parts.len() != 3 {
-                return Err(anyhow::anyhow!("failed to parse memory line: {}", line));
-            }
-
-            let timestamp = parts[0].parse::<f64>()?;
-            let heap_total = parts[1].parse::<u64>()?;
-            let total = parts[2].parse::<u64>()?;
-
-            meta.memory.push((timestamp, heap_total, total));
-        }
-
-        Ok(meta)
+        Ok(serde_json::from_str(data)?)
     }
 }
 
 struct RuntimeData {
     profile: Profile,
     process: ProcessHandle,
-    pid: u32,
     ms_per_sample: f64,
     user_category: CategoryHandle,
     system_category: CategoryHandle,
@@ -217,13 +188,13 @@ struct RuntimeData {
     mods_category: CategoryHandle,
     other_category: CategoryHandle,
     meta: PerfMeta,
-    memory_counter: CounterHandle,
-    heap_counter: CounterHandle,
 
     libs: HashMap<String, StoredLibrary>,
     libs_sorted: BTreeMap<u64, StoredLibrary>,
     symbol_manager: SymbolManager,
     gd_dir: String,
+
+    free_colors: RefCell<VecDeque<GraphColor>>,
 }
 
 impl RuntimeData {
@@ -246,19 +217,13 @@ impl RuntimeData {
             profile.handle_for_category(Category("Geode Mods", CategoryColor::Purple));
         let other_category = profile.handle_for_category(Category::OTHER);
 
-        let memory_counter = profile.add_counter(process, "Total memory", "memory", "Total memory");
-        profile.set_counter_color(memory_counter, GraphColor::Orange);
-        let heap_counter = profile.add_counter(process, "Heap memory", "memory", "Heap memory");
-        profile.set_counter_color(heap_counter, GraphColor::Yellow);
-
-        let meta_data = std::fs::read_to_string(format!("/tmp/perf-{}.meta.txt", pid))
-            .expect("failed to read meta.txt");
-        let meta = PerfMeta::parse(&meta_data).expect("failed to parse meta.txt");
+        let meta_data = std::fs::read_to_string(format!("/tmp/perf-{}.meta.json", pid))
+            .expect("failed to read meta.json");
+        let meta = PerfMeta::parse(&meta_data).expect("failed to parse meta.json");
 
         Self {
             profile,
             process,
-            pid,
             ms_per_sample,
             user_category,
             system_category,
@@ -268,18 +233,25 @@ impl RuntimeData {
             mods_category,
             other_category,
             meta,
-            memory_counter,
-            heap_counter,
             libs: HashMap::new(),
             libs_sorted: BTreeMap::new(),
             symbol_manager: SymbolManager::with_config(SymbolManagerConfig::default()),
             gd_dir,
+            // colors that are not used by any other counter
+            free_colors: RefCell::new(VecDeque::from(vec![
+                GraphColor::Green,
+                GraphColor::Ink,
+                GraphColor::Magenta,
+                GraphColor::Purple,
+                GraphColor::Red,
+                GraphColor::Teal,
+            ])),
         }
     }
 
     pub fn initialize(&mut self) {
-        for (address, path) in &self.meta.modules {
-            let name = PathBuf::from(path)
+        for module in &self.meta.modules {
+            let name = PathBuf::from(&module.full_path)
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
@@ -288,7 +260,7 @@ impl RuntimeData {
             let lib = self.profile.add_lib(LibraryInfo {
                 name: name.clone(),
                 debug_name: name.clone(),
-                path: path.to_string(),
+                path: module.full_path.clone(),
                 debug_path: String::new(),
                 debug_id: DebugId::nil(),
                 code_id: None,
@@ -297,15 +269,15 @@ impl RuntimeData {
 
             let library = StoredLibrary {
                 handle: lib,
-                base_address: *address,
+                base_address: module.base,
                 size: 0,
             };
-            self.libs.insert(path.to_string(), library.clone());
-            self.libs_sorted.insert(*address, library);
+            self.libs.insert(module.full_path.clone(), library.clone());
+            self.libs_sorted.insert(module.base, library);
         }
 
-        for (start, end, path) in &self.meta.maps {
-            let Some(lib) = self.libs.get_mut(path) else {
+        for map in &self.meta.maps {
+            let Some(lib) = self.libs.get_mut(&map.pathname) else {
                 continue;
             };
             let Some(sorted_lib) = self.libs_sorted.get_mut(&lib.base_address) else {
@@ -315,26 +287,45 @@ impl RuntimeData {
             self.profile.add_lib_mapping(
                 self.process,
                 lib.handle,
-                *start,
-                *end,
-                (start - lib.base_address) as u32,
+                map.start,
+                map.end,
+                (map.start - lib.base_address) as u32,
             );
-            lib.size = lib.size.max(end - lib.base_address);
+            lib.size = lib.size.max(map.end - lib.base_address);
             sorted_lib.size = lib.size;
         }
 
-        for &(rel_timestamp, heap_bytes, total_bytes) in &self.meta.memory {
-            let time = Timestamp::from_millis_since_reference(
-                Duration::from_secs_f64(rel_timestamp).as_millis_f64(),
-            );
-            let total_bytes = total_bytes as f64;
-            let heap_bytes = heap_bytes as f64;
+        for (name, values) in &self.meta.counters {
+            let props = self.get_counter_properties(name);
 
-            // note: despite the arg saying value_delta, it actually expects an absolute value
-            self.profile
-                .add_counter_sample(self.memory_counter, time, total_bytes, 1);
-            self.profile
-                .add_counter_sample(self.heap_counter, time, heap_bytes, 1);
+            let counter_handle =
+                self.profile
+                    .add_counter(self.process, name, &props.category, &props.description);
+            self.profile.set_counter_color(counter_handle, props.color);
+
+            let mut last_value = None;
+            for value in values {
+                let time = Timestamp::from_millis_since_reference(
+                    Duration::from_secs_f64(value.timestamp).as_millis_f64(),
+                );
+
+                // note: despite the arg saying value_delta, whether it expects a delta or not depends entirely on the category
+                // it seems like Memory counters expect a delta, while others don't, and will display bogus data if you give them a delta.
+                let shown_value = if props.category == "Memory" {
+                    let delta = if let Some(last) = last_value {
+                        value.value as f64 - last
+                    } else {
+                        value.value as f64
+                    };
+                    last_value = Some(value.value as f64);
+                    delta
+                } else {
+                    value.value as f64
+                };
+
+                self.profile
+                    .add_counter_sample(counter_handle, time, shown_value, 1);
+            }
         }
     }
 
@@ -422,8 +413,34 @@ impl RuntimeData {
 
         Ok(self)
     }
+
+    fn get_counter_properties(&self, name: &str) -> CounterGraphProperties {
+        let color = match name {
+            "Total memory" => GraphColor::Orange,
+            "Heap memory" => GraphColor::Yellow,
+            "Objects" => GraphColor::Blue,
+            _ => self
+                .free_colors
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(GraphColor::Grey),
+        };
+
+        let category = match name {
+            "Total memory" | "Heap memory" => "Memory",
+            _ => "Other",
+        }
+        .to_owned();
+
+        CounterGraphProperties {
+            color,
+            category,
+            description: name.to_owned(),
+        }
+    }
 }
 
+#[allow(unused)]
 fn convert_address_frame(
     frame: &FrameDebugInfo,
     strtab: &mut SymbolStringTable,
@@ -534,7 +551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample = Some(Sample {
                 thread,
                 timestamp: cvt_time(header.timestamp),
-                sample_num: header.sample_number,
+                // sample_num: header.sample_number,
                 frames: Vec::new(),
             });
 

@@ -11,6 +11,7 @@
 	"version": "v1.0.0",
 	"developer": "dankmeme",
 	"description": "",
+	"early-load": true,
 	"dependencies": {
 		"geode.node-ids": ">=v1.23.3"
 	}

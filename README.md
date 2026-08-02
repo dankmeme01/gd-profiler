@@ -62,9 +62,10 @@ Note that the data is not perfect, many stacks may stop after 10-15 functions ev
 
 ## Helper mod
 
-In the [`profiler-mod`](./profiler-mod/) subfolder, you will find the helper profiler mod. This mod hooks some parts of the game and provides various data for additional graphs. When not actively profiling, the mod is deactivated and does not do anything.
+In the [`profiler-mod`](./profiler-mod/) subfolder, you will find the helper profiler mod. This mod hooks some parts of the game and provides various data for additional graphs. When not actively profiling, the mod is deactivated and does not do anything, avoiding any negative performance impact. However, it is designed to be extremely lightweight, so it's recommended to have it even when profiling, you are unlikely to see a performance issue.
 
 # TODO
 
+* gd.exe symbols using bindings
 * thread events to display accurate thread ends?
 * figure out how to fix the stacks, `--stitch-lbr` or `--call-graph dwarf` do not work

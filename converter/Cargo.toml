@@ -11,3 +11,4 @@ regex = "1.12.4"
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
 sysinfo = "0.38.4"
+serde = { version = "1.0.229", features = ["derive"] }

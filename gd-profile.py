@@ -5,8 +5,10 @@ import os
 import subprocess
 import argparse
 import time
+import json
 import pefile
 import shutil
+import socket
 from threading import Thread
 from pydantic import BaseModel
 from pathlib import Path
@@ -34,6 +36,7 @@ memory_measurements: list[MemoryMeasurement] = []
 stopping: bool = False
 maps: list[MemoryMapping] = []
 modules: dict[str, LoadedModule] = {}
+custom_counters: dict[str, list[tuple[float, int]]] = {}
 
 def parse_maps(pid: int) -> list[MemoryMapping]:
     mappings: list[MemoryMapping] = []
@@ -148,8 +151,49 @@ def maps_measure_worker(proc: subprocess.Popen, epoch: float):
 
         time.sleep(0.25)
 
+def socket_listener_worker(sock: socket.socket, epoch: float):
+    def recvall(conn: socket.socket, n: int) -> bytearray | None:
+        data = bytearray()
+        while len(data) < n:
+            try:
+                chunk = conn.recv(n - len(data))
+                if not chunk:
+                    return None
+                data.extend(chunk)
+            except socket.timeout:
+                if stopping:
+                    return None
+                continue
+        return data
+
+    sock.settimeout(0.5)
+    while not stopping:
+        try:
+            conn, addr = sock.accept()
+        except socket.timeout:
+            continue
+        print(f"[profiler] received TCP connection from {addr}")
+
+        with conn:
+            conn.settimeout(0.5)
+            while not stopping:
+                length_bytes = recvall(conn, 4)
+                if not length_bytes:
+                    break
+                length = int.from_bytes(length_bytes, byteorder='little')
+
+                payload = recvall(conn, length)
+                if not payload:
+                    break
+
+                ts = time.time() - epoch
+                data = json.loads(payload.decode())
+
+                for counter, value in data["counters"].items():
+                    custom_counters.setdefault(counter, []).append((ts, value))
+
 # Run GD in Wine and return the PID
-def run_gd(wine_path: Path, gd_path: Path, gd_args: list[str]) -> subprocess.Popen:
+def run_gd(wine_path: Path, gd_path: Path, gd_args: list[str], port: int) -> subprocess.Popen:
     global work_dir
 
     if not wine_path.exists():
@@ -160,6 +204,7 @@ def run_gd(wine_path: Path, gd_path: Path, gd_args: list[str]) -> subprocess.Pop
     work_dir = gd_path.parent
     print(f"[profiler] Running {gd_path} with Wine {wine_path} (version {get_wine_version(wine_path)}), extra args: {gd_args}")
 
+    os.environ["GD_PROFILER_PORT"] = str(port)
     return subprocess.Popen(
         [str(wine_path), str(gd_path.absolute()), *gd_args],
         cwd=work_dir,
@@ -219,10 +264,17 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    s.listen(5)
+    port = s.getsockname()[1]
+    print(f"[profiler] listening on port {port} for incoming mod connections")
+
     gd = run_gd(
         wine_path=args.wine_path or Path("/usr/bin/wine"),
         gd_path=args.gd_exe,
-        gd_args=args.gd_args
+        gd_args=args.gd_args,
+        port=port,
     )
     pid = gd.pid
     print(f"[profiler] GD is running, pid: {pid}")
@@ -242,6 +294,11 @@ if __name__ == "__main__":
     aux_workers.append(maps_worker)
     maps_worker.start()
 
+    # spawn socket listener worker
+    socket_worker = Thread(target=socket_listener_worker, args=(s, start_time), daemon=True)
+    aux_workers.append(socket_worker)
+    socket_worker.start()
+
     print(f"[profiler] nothing else to do, waiting for the game to exit...")
     gd.wait()
     print(f"[profiler] game exit detected, stopping perf")
@@ -252,19 +309,44 @@ if __name__ == "__main__":
     # join all workers
     [worker.join() for worker in aux_workers]
 
-    print(f"[profiler] writing metadata to /tmp/perf-{gd.pid}.meta.txt")
-    with open(f"/tmp/perf-{gd.pid}.meta.txt", 'w') as f:
-        f.write(f"Modules:\n")
-        for module in modules.values():
-            f.write(f"{module.base:x} {module.full_path}\n")
+    print(f"[profiler] writing metadata to /tmp/perf-{gd.pid}.meta.json")
 
-        f.write(f"\nMaps:\n")
-        for map in maps:
-            f.write(f"{map.start:x} {map.end:x} {map.pathname}\n")
+    # convert memory measurements to be a counter
+    # skip total memory for now
+    m_heap = custom_counters.setdefault("Heap memory", [])
+    # m_total = custom_counters.setdefault("Total memory", [])
+    for m in memory_measurements:
+        m_heap.append((m.timestamp, m.heap_bytes))
+        # m_total.append((m.timestamp, m.total_bytes))
 
-        f.write(f"\nMemory:\n")
-        for m in memory_measurements:
-            f.write(f"{m.timestamp:.6f} {m.heap_bytes} {m.total_bytes}\n")
+    with open(f"/tmp/perf-{gd.pid}.meta.json", 'w') as f:
+        json.dump({
+            "modules": [
+                {
+                    "name": module.name,
+                    "full_path": str(module.full_path),
+                    "base": module.base
+                }
+                for module in modules.values()
+            ],
+            "maps": [
+                {
+                    "start": map.start,
+                    "end": map.end,
+                    "pathname": map.pathname
+                }
+                for map in maps
+            ],
+            "counters": {
+                counter: [
+                    {
+                        "timestamp": ts,
+                        "value": value
+                    } for ts, value in values
+                ]
+                for counter, values in custom_counters.items()
+            }
+        }, f)
 
     print(f"[profiler] running perf script to convert the profile into text...")
     p = run_perf_conversion(pid)
