@@ -9,9 +9,13 @@ import json
 import pefile
 import shutil
 import socket
+import webbrowser
 from threading import Thread
 from pydantic import BaseModel
 from pathlib import Path
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from functools import partial
+import urllib.parse
 
 SYMBOL_THREADS = 8
 SYMBOL_CACHE_PATH = Path.home() / ".cache" / "gd-profiler-symbol-cache.json"
@@ -254,11 +258,56 @@ def run_fxprof_conversion(pid: int, perf_script_path: Path, frequency: int, gd_e
     f.close()
     return p
 
+class ProfilerReqHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, target_file: Path, **kwargs):
+        self.target_file = target_file.name
+        super().__init__(*args, directory=target_file.parent, **kwargs)
+
+    # cors bullshit
+    def end_headers(self) -> None:
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header(
+            'Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS'
+        )
+        self.send_header(
+            'Access-Control-Allow-Headers',
+            'X-Requested-With, Content-Type, Accept, Origin, Authorization',
+        )
+        self.send_header('Access-Control-Max-Age', '86400')
+        super().end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(200)
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        self.path = self.target_file
+        return super().do_GET()
+
+def open_profiler_browser(fxprof_path: Path):
+    httpd = HTTPServer(("", 0), partial(ProfilerReqHandler, target_file=fxprof_path))
+    t = Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+
+    port = httpd.server_port
+    local_url = f"http://localhost:{port}"
+    url = f"https://profiler.firefox.com/from-url/{urllib.parse.quote(local_url, safe="")}"
+    print(url)
+    webbrowser.open(url)
+
+    print(f"--- profile opened in your browser, press Ctrl+C to stop and exit ---")
+
+    try:
+        t.join()
+    except KeyboardInterrupt:
+        pass
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--wine-path", type=Path, required=False, help="Path to the Wine executable")
     parser.add_argument("--frequency", "-F", type=int, required=False, default=1000, help="Sampling frequency for perf")
     parser.add_argument("--call-graph", "-g", default="lbr", help="Call graph method for perf (lbr, fp, dwarf)")
+    parser.add_argument("--no-browser-open", action="store_true", help="Do not open the profile in the browser after conversion")
     parser.add_argument("gd_exe", type=Path, nargs="?", default=Path("GeometryDash.exe"), help="Path to the GD executable")
     parser.add_argument("gd_args", nargs=argparse.REMAINDER, help="Additional arguments to pass to GD")
 
@@ -354,6 +403,9 @@ if __name__ == "__main__":
     fxp = run_fxprof_conversion(gd.pid, p, args.frequency, args.gd_exe, int(start_time * 1000.0))
     if fxp:
         print(f"[profiler] fxprof profile now available at {fxp} and can be loaded at https://profiler.firefox.com/")
+        if not args.no_browser_open:
+            open_profiler_browser(fxp)
     else:
         print(f"[profiler] converter is unavailable! please ensure you built 'fxprof-converter' and put it in PATH")
         print(f"[profiler] for now, you can still use the raw perf script output by loading it at https://profiler.firefox.com/")
+
